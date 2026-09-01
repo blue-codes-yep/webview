@@ -1,7 +1,8 @@
 # Visual hosting on Windows (WebView2 composition controller)
 
-**Status:** in progress. This document is the rationale and the measured
-evidence; the implementation follows it.
+**Status:** implemented and running in a real application. Mouse, wheel, drag
+and cursor are forwarded; touch/pen (`SendPointerInput`) is not yet. This
+document is the rationale and the measured evidence behind the design.
 
 ## The problem
 
@@ -112,10 +113,10 @@ Add an opt-in visual-hosting path alongside the existing windowed one:
 Windowed hosting stays the default. Visual hosting is opt-in, because it
 carries a real cost:
 
-### Input must be forwarded by hand
+### Pointer input must be forwarded by hand
 
 This is the substantive work, not the rendering. A visual-hosted WebView2
-receives no input from the system. The host must forward it via
+receives no *pointer* input from the system. The host must forward it via
 `ICoreWebView2CompositionController`:
 
 - `SendMouseInput` for every move, button, double-click and wheel event,
@@ -123,13 +124,18 @@ receives no input from the system. The host must forward it via
 - pointer input for touch and pen, via `SendPointerInput`;
 - cursor updates — the controller exposes a `Cursor` property and a
   `CursorChanged` event; without handling it the cursor never changes over web
-  content;
-- focus, and IME/composition for non-Latin input.
+  content.
 
 Getting any of these subtly wrong produces bugs that are hard to attribute: drag
-selection that stops at the window edge, hover states that stick, a text caret
-that ignores an IME. Anyone enabling visual hosting is taking that on, which is
-why it is not the default.
+selection that stops at the window edge, or hover states that stick. Anyone
+enabling visual hosting is taking that on, which is why it is not the default.
+
+**Keyboard input needs nothing.** There is no `SendKeyboardInput` anywhere in
+the WebView2 API — the composition controller exposes only `SendMouseInput` and
+`SendPointerInput`. Keyboard follows window focus and reaches the web content
+through the normal mechanism. Worth stating plainly, because "visual hosting
+means forwarding *all* input by hand" is the natural assumption, and acting on
+it would mean building something the platform already handles.
 
 ## Why this belongs upstream
 
