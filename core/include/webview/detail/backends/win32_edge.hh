@@ -394,6 +394,11 @@ private:
 class win32_edge_engine : public engine_base {
 public:
   win32_edge_engine(bool debug, void *window) : engine_base{!window} {
+    // Opt-in via the environment for now. Visual hosting deserves a real
+    // public API (a create-option, most likely); an env var keeps this branch
+    // reviewable without inventing one that upstream may not want.
+    // See docs/visual-hosting.md.
+    m_visual_hosting = is_visual_hosting_requested();
     window_init(window);
     window_settings(debug);
     dispatch_size_default();
@@ -997,6 +1002,34 @@ private:
   // CreateCoreWebView2EnvironmentWithOptions.
   // Source: https://docs.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl#createcorewebview2environmentwithoptions
   com_init_wrapper m_com_init;
+  static bool is_visual_hosting_requested() noexcept {
+    wchar_t buf[8]{};
+    auto n = GetEnvironmentVariableW(L"WEBVIEW_VISUAL_HOSTING", buf, 8);
+    return n > 0 && n < 8 && buf[0] == L'1';
+  }
+
+public:
+  /// True when the web content is being hosted in a DirectComposition visual
+  /// tree rather than its own window.
+  bool visual_hosting() const noexcept {
+    return m_composition_controller != nullptr && !m_composition_failed;
+  }
+
+  /// The DirectComposition device backing the visual tree, or null under
+  /// windowed hosting. An embedder needs it to create its own visuals and to
+  /// Commit after changing the tree.
+  IDCompositionDevice *composition_device() const noexcept {
+    return m_dcomp_device;
+  }
+
+  /// The root visual. The web content's visual is already a child; visuals
+  /// added BELOW it (AddVisual with insertAbove=FALSE) show through wherever
+  /// the page is transparent, which is the point of visual hosting.
+  IDCompositionVisual *composition_root() const noexcept {
+    return m_root_visual;
+  }
+
+private:
   // Adopt the cursor WebView2 wants for the position it last saw. Polled from
   // WM_SETCURSOR rather than subscribing to CursorChanged: the property is
   // already up to date by then, and it avoids implementing another COM handler.
