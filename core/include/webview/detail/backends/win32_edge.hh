@@ -68,6 +68,7 @@
 
 #include <windows.h>
 
+#include <cstdio>
 #include <objbase.h>
 // Visual hosting (docs/visual-hosting.md); harmless when unused.
 #include <dcomp.h>
@@ -175,6 +176,10 @@ public:
             return S_OK;
           }
         }
+      }
+      if (m_visual_hosting) {
+        std::fprintf(stderr, "webview: visual hosting unavailable on this "
+                             "WebView2 runtime; using windowed hosting\n");
       }
       res = env->CreateCoreWebView2Controller(m_window, this);
       if (SUCCEEDED(res)) {
@@ -864,10 +869,18 @@ private:
             m_composition_controller = composition;
             // Build the tree BEFORE the controller finishes initialising, so
             // the first rendered frame already has somewhere to go.
-            if (!build_composition_tree(wnd, composition)) {
-              // Rendering would silently go nowhere, which is the single worst
-              // failure mode here — say so rather than showing a blank window.
+            if (build_composition_tree(wnd, composition)) {
+              // An opt-in mode that looks identical when it works is
+              // indistinguishable from one that never engaged, so say which
+              // happened. Silence here costs someone an afternoon.
+              std::fprintf(stderr, "webview: visual hosting active "
+                                   "(DirectComposition)\n");
+            } else {
+              // Rendering would go nowhere at all, which is the worst failure
+              // mode here — report it rather than showing a blank window.
               m_composition_failed = true;
+              std::fprintf(stderr, "webview: visual hosting requested but the "
+                                   "composition tree could not be built\n");
             }
           });
     }
