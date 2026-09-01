@@ -490,6 +490,12 @@ protected:
     }
     return error_info{WEBVIEW_ERROR_INVALID_STATE};
   }
+  result<void *> composition_device_impl() override {
+    // Null rather than an error under windowed hosting: absence is the normal
+    // answer, not a failure, and callers branch on it.
+    return m_dcomp_device;
+  }
+  result<void *> composition_root_impl() override { return m_root_visual; }
   noresult terminate_impl() override {
     PostQuitMessage(0);
     return {};
