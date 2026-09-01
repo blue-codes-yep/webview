@@ -869,6 +869,12 @@ private:
             m_composition_controller = composition;
             // Build the tree BEFORE the controller finishes initialising, so
             // the first rendered frame already has somewhere to go.
+            // Visual hosting only pays off if the page can be transparent —
+            // otherwise the web content is an opaque sheet over whatever the
+            // embedder put underneath. Set it here, where the typed interface
+            // is available, rather than leaving embedders to hand-roll the COM
+            // call against a vtable they have to count by hand.
+            set_transparent_background(composition);
             if (build_composition_tree(wnd, composition)) {
               // An opt-in mode that looks identical when it works is
               // indistinguishable from one that never engaged, so say which
@@ -1015,6 +1021,31 @@ private:
   // CreateCoreWebView2EnvironmentWithOptions.
   // Source: https://docs.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl#createcorewebview2environmentwithoptions
   com_init_wrapper m_com_init;
+  // Make the web content's background transparent so visuals beneath it show
+  // through. Best-effort: an older runtime without ICoreWebView2Controller2
+  // simply stays opaque.
+  static void
+  set_transparent_background(ICoreWebView2CompositionController *composition) {
+    ICoreWebView2Controller2 *controller2{};
+    if (FAILED(composition->QueryInterface(
+            IID_ICoreWebView2Controller2,
+            reinterpret_cast<void **>(&controller2))) ||
+        !controller2) {
+      std::fprintf(stderr, "webview: transparent background unavailable on "
+                           "this WebView2 runtime\n");
+      return;
+    }
+    // Only alpha 0 and 255 are supported; anything between is rejected.
+    COREWEBVIEW2_COLOR transparent{0, 0, 0, 0};
+    auto res = controller2->put_DefaultBackgroundColor(transparent);
+    if (FAILED(res)) {
+      std::fprintf(stderr,
+                   "webview: transparent background rejected (0x%08lx)\n",
+                   static_cast<unsigned long>(res));
+    }
+    controller2->Release();
+  }
+
   static bool is_visual_hosting_requested() noexcept {
     wchar_t buf[8]{};
     auto n = GetEnvironmentVariableW(L"WEBVIEW_VISUAL_HOSTING", buf, 8);
