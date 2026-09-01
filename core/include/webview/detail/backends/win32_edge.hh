@@ -69,6 +69,8 @@
 #include <windows.h>
 
 #include <objbase.h>
+// Visual hosting (docs/visual-hosting.md); harmless when unused.
+#include <dcomp.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 
@@ -85,13 +87,30 @@ namespace detail {
 
 using msg_cb_t = std::function<void(const std::string)>;
 
+// DirectComposition entry points resolved at runtime, so visual hosting costs
+// nothing to link and degrades gracefully where DirectComposition is absent.
+// At namespace scope like webview2_symbols: a class-scope `static constexpr`
+// member would need an out-of-line definition under -std=c++14.
+namespace dcomp_symbols {
+using DCompositionCreateDevice_t =
+    HRESULT(STDMETHODCALLTYPE *)(IDXGIDevice *, REFIID, void **);
+static constexpr auto DCompositionCreateDevice =
+    library_symbol<DCompositionCreateDevice_t>("DCompositionCreateDevice");
+} // namespace dcomp_symbols
+
 class webview2_com_handler
     : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler,
       public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
+      public ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler,
       public ICoreWebView2WebMessageReceivedEventHandler,
       public ICoreWebView2PermissionRequestedEventHandler {
   using webview2_com_handler_cb_t =
       std::function<void(ICoreWebView2Controller *, ICoreWebView2 *webview)>;
+  // Visual hosting hands the composition controller back separately: the
+  // embedder needs it to attach a visual tree and to forward input, neither of
+  // which the plain controller can do.
+  using webview2_composition_cb_t =
+      std::function<void(ICoreWebView2CompositionController *)>;
 
 public:
   webview2_com_handler(HWND hwnd, msg_cb_t msgCb, webview2_com_handler_cb_t cb)
@@ -129,6 +148,7 @@ public:
     // observed to be requested when using the official WebView2 loader.
 
     if (cast_if_equal_iid(this, riid, controller_completed, ppv) ||
+        cast_if_equal_iid(this, riid, composition_controller_completed, ppv) ||
         cast_if_equal_iid(this, riid, environment_completed, ppv) ||
         cast_if_equal_iid(this, riid, message_received, ppv) ||
         cast_if_equal_iid(this, riid, permission_requested, ppv)) {
@@ -139,6 +159,21 @@ public:
   }
   HRESULT STDMETHODCALLTYPE Invoke(HRESULT res, ICoreWebView2Environment *env) {
     if (SUCCEEDED(res)) {
+      if (m_visual_hosting) {
+        // ICoreWebView2Environment3 is where CreateCoreWebView2CompositionController
+        // lives. A runtime too old to offer it falls back to windowed hosting
+        // rather than failing to start.
+        ICoreWebView2Environment3 *env3{};
+        if (SUCCEEDED(env->QueryInterface(IID_ICoreWebView2Environment3,
+                                          reinterpret_cast<void **>(&env3))) &&
+            env3) {
+          res = env3->CreateCoreWebView2CompositionController(m_window, this);
+          env3->Release();
+          if (SUCCEEDED(res)) {
+            return S_OK;
+          }
+        }
+      }
       res = env->CreateCoreWebView2Controller(m_window, this);
       if (SUCCEEDED(res)) {
         return S_OK;
@@ -146,6 +181,39 @@ public:
     }
     try_create_environment();
     return S_OK;
+  }
+
+  // Visual hosting completion. The composition controller IS a controller, so
+  // once the tree is attached everything downstream is shared with the windowed
+  // path — only the hosting differs.
+  HRESULT STDMETHODCALLTYPE
+  Invoke(HRESULT res, ICoreWebView2CompositionController *composition) {
+    if (FAILED(res) || !composition) {
+      switch (res) {
+      case HRESULT_FROM_WIN32(ERROR_INVALID_STATE):
+      case E_ABORT:
+        return S_OK;
+      }
+      try_create_environment();
+      return S_OK;
+    }
+    ICoreWebView2Controller *controller{};
+    if (FAILED(composition->QueryInterface(IID_ICoreWebView2Controller,
+                                           reinterpret_cast<void **>(
+                                               &controller))) ||
+        !controller) {
+      try_create_environment();
+      return S_OK;
+    }
+    // Hand the composition controller over BEFORE the usual controller setup,
+    // so the embedder can attach its visual tree before any content renders —
+    // otherwise the first frames have nowhere to go.
+    if (m_composition_cb) {
+      m_composition_cb(composition);
+    }
+    auto result = Invoke(S_OK, controller);
+    controller->Release();
+    return result;
   }
   HRESULT STDMETHODCALLTYPE Invoke(HRESULT res,
                                    ICoreWebView2Controller *controller) {
@@ -194,6 +262,16 @@ public:
     return S_OK;
   }
 
+  // Opt into visual hosting. Must be set before the environment completes.
+  // See docs/visual-hosting.md: it exists so an embedder can composite its own
+  // content with the web content, and it makes input the host's problem.
+  void set_visual_hosting(bool on) noexcept { m_visual_hosting = on; }
+
+  // Receives the composition controller when visual hosting is in effect.
+  void set_composition_handler(webview2_composition_cb_t cb) noexcept {
+    m_composition_cb = cb;
+  }
+
   // Set the function that will perform the initiating logic for creating
   // the WebView2 environment.
   void set_attempt_handler(std::function<HRESULT()> attempt_handler) noexcept {
@@ -232,6 +310,8 @@ private:
   HWND m_window;
   msg_cb_t m_msgCb;
   webview2_com_handler_cb_t m_cb;
+  webview2_composition_cb_t m_composition_cb;
+  bool m_visual_hosting{};
   std::atomic<ULONG> m_ref_count{1};
   std::function<HRESULT()> m_attempt_handler;
   unsigned int m_max_attempts = 60;
@@ -754,6 +834,22 @@ private:
           flag.clear();
         });
 
+    if (m_visual_hosting) {
+      m_com_handler->set_visual_hosting(true);
+      m_com_handler->set_composition_handler(
+          [&](ICoreWebView2CompositionController *composition) {
+            composition->AddRef();
+            m_composition_controller = composition;
+            // Build the tree BEFORE the controller finishes initialising, so
+            // the first rendered frame already has somewhere to go.
+            if (!build_composition_tree(wnd, composition)) {
+              // Rendering would silently go nowhere, which is the single worst
+              // failure mode here — say so rather than showing a blank window.
+              m_composition_failed = true;
+            }
+          });
+    }
+
     m_com_handler->set_attempt_handler([&] {
       return m_webview2_loader.create_environment_with_options(
           nullptr, userDataFolder, nullptr, m_com_handler);
@@ -884,6 +980,59 @@ private:
   // CreateCoreWebView2EnvironmentWithOptions.
   // Source: https://docs.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl#createcorewebview2environmentwithoptions
   com_init_wrapper m_com_init;
+  // Visual hosting: the DirectComposition tree the web content renders into.
+  // The embedder can insert its own visuals as siblings of m_webview_visual to
+  // composite native content above or below the page (docs/visual-hosting.md).
+  bool build_composition_tree(HWND wnd,
+                              ICoreWebView2CompositionController *composition) {
+    // dcomp.dll is loaded at RUNTIME rather than linked, mirroring how this
+    // library already loads WebView2Loader.dll. Linking dcomp.lib would make
+    // every consumer pay for a feature that is opt-in, and would refuse to
+    // start on systems without DirectComposition; this simply reports failure
+    // and lets the caller fall back to windowed hosting.
+    //
+    // __uuidof rather than an IID_ constant: MSVC's dcomp.h uses DECLSPEC_UUID
+    // and mingw-w64's uses __CRT_UUID_DECL, so it is the spelling that works
+    // under both toolchains.
+    if (!m_dcomp_lib.is_loaded()) {
+      return false;
+    }
+    auto create_device = m_dcomp_lib.get(dcomp_symbols::DCompositionCreateDevice);
+    if (!create_device) {
+      return false;
+    }
+    if (FAILED(create_device(nullptr, __uuidof(IDCompositionDevice),
+                             reinterpret_cast<void **>(&m_dcomp_device))) ||
+        !m_dcomp_device) {
+      return false;
+    }
+    // topmost=FALSE: the target sits in the window's normal composition, so
+    // other windows still occlude it correctly.
+    if (FAILED(m_dcomp_device->CreateTargetForHwnd(wnd, FALSE,
+                                                   &m_dcomp_target)) ||
+        !m_dcomp_target) {
+      return false;
+    }
+    if (FAILED(m_dcomp_device->CreateVisual(&m_root_visual)) ||
+        !m_root_visual) {
+      return false;
+    }
+    if (FAILED(m_dcomp_device->CreateVisual(&m_webview_visual)) ||
+        !m_webview_visual) {
+      return false;
+    }
+    // The web content goes on top; an embedder's visuals added BELOW it show
+    // through wherever the page is transparent.
+    if (FAILED(m_root_visual->AddVisual(m_webview_visual, TRUE, nullptr)) ||
+        FAILED(m_dcomp_target->SetRoot(m_root_visual))) {
+      return false;
+    }
+    if (FAILED(composition->put_RootVisualTarget(m_webview_visual))) {
+      return false;
+    }
+    return SUCCEEDED(m_dcomp_device->Commit());
+  }
+
   HWND m_window = nullptr;
   HWND m_widget = nullptr;
   HWND m_message_window = nullptr;
@@ -892,6 +1041,15 @@ private:
   DWORD m_main_thread = GetCurrentThreadId();
   ICoreWebView2 *m_webview = nullptr;
   ICoreWebView2Controller *m_controller = nullptr;
+  // Visual hosting state; all null under the default windowed path.
+  bool m_visual_hosting = false;
+  bool m_composition_failed = false;
+  ICoreWebView2CompositionController *m_composition_controller = nullptr;
+  native_library m_dcomp_lib{L"dcomp.dll"};
+  IDCompositionDevice *m_dcomp_device = nullptr;
+  IDCompositionTarget *m_dcomp_target = nullptr;
+  IDCompositionVisual *m_root_visual = nullptr;
+  IDCompositionVisual *m_webview_visual = nullptr;
   webview2_com_handler *m_com_handler = nullptr;
   mswebview2::loader m_webview2_loader;
   int m_dpi{};
