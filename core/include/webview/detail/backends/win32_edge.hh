@@ -73,6 +73,8 @@
 #include <dcomp.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+// GET_X_LPARAM / GET_KEYSTATE_WPARAM for visual-hosting input forwarding.
+#include <windowsx.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ole32.lib")
@@ -722,6 +724,21 @@ private:
         return DefWindowProcW(hwnd, msg, wp, lp);
       }
 
+      // Visual hosting receives NO input from the system: the host must forward
+      // it. Done before the switch so every mouse message reaches the web
+      // content, including ones this proc does not otherwise handle.
+      if (w->m_composition_controller) {
+        // The system does not update the cursor over visual-hosted content;
+        // without this it stays an arrow over links and text.
+        if (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT &&
+            w->apply_webview_cursor()) {
+          return TRUE;
+        }
+        if (w->forward_mouse_input(msg, wp, lp)) {
+          return 0;
+        }
+      }
+
       switch (msg) {
       case WM_SIZE:
         w->resize_webview();
@@ -980,6 +997,90 @@ private:
   // CreateCoreWebView2EnvironmentWithOptions.
   // Source: https://docs.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl#createcorewebview2environmentwithoptions
   com_init_wrapper m_com_init;
+  // Adopt the cursor WebView2 wants for the position it last saw. Polled from
+  // WM_SETCURSOR rather than subscribing to CursorChanged: the property is
+  // already up to date by then, and it avoids implementing another COM handler.
+  bool apply_webview_cursor() {
+    HCURSOR cursor{};
+    if (FAILED(m_composition_controller->get_Cursor(&cursor)) || !cursor) {
+      return false;
+    }
+    SetCursor(cursor);
+    return true;
+  }
+
+  // Forward one mouse message to a visual-hosted WebView2. Returns true when
+  // the message was consumed.
+  //
+  // COREWEBVIEW2_MOUSE_EVENT_KIND values ARE the Win32 message ids, and
+  // COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS values are the MK_* flags, so both
+  // pass straight through. The parts that do not:
+  //
+  //  * wheel messages carry SCREEN coordinates while the rest carry client
+  //    coordinates, so they need converting or the page scrolls from the wrong
+  //    place;
+  //  * wheel and X-button messages put their payload (delta, which X button) in
+  //    the high word of wParam, which is what mouseData wants;
+  //  * a drag that leaves the window stops delivering moves unless the mouse is
+  //    captured, and WM_MOUSELEAVE only arrives if TrackMouseEvent asked for it
+  //    — without that, hover states stick after the pointer leaves.
+  bool forward_mouse_input(UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_MOUSELEAVE) {
+      m_mouse_tracking = false;
+      POINT origin{};
+      m_composition_controller->SendMouseInput(
+          COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE,
+          COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0, origin);
+      return true;
+    }
+    const bool is_wheel = (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL);
+    const bool is_button =
+        (msg >= WM_LBUTTONDOWN && msg <= WM_MBUTTONDBLCLK) ||
+        (msg >= WM_XBUTTONDOWN && msg <= WM_XBUTTONDBLCLK);
+    if (msg != WM_MOUSEMOVE && !is_wheel && !is_button) {
+      return false;
+    }
+
+    POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    if (is_wheel) {
+      // Wheel messages are in screen space; everything else is already client.
+      ScreenToClient(m_widget, &point);
+    }
+
+    UINT32 mouse_data = 0;
+    if (is_wheel) {
+      mouse_data = static_cast<UINT32>(GET_WHEEL_DELTA_WPARAM(wp));
+    } else if (msg >= WM_XBUTTONDOWN && msg <= WM_XBUTTONDBLCLK) {
+      mouse_data = GET_XBUTTON_WPARAM(wp);
+    }
+
+    if (msg == WM_MOUSEMOVE && !m_mouse_tracking) {
+      // Ask for WM_MOUSELEAVE once per entry, so hover state can be cleared.
+      TRACKMOUSEEVENT tme{};
+      tme.cbSize = sizeof(tme);
+      tme.dwFlags = TME_LEAVE;
+      tme.hwndTrack = m_widget;
+      m_mouse_tracking = TrackMouseEvent(&tme) != FALSE;
+    }
+    // Capture for the duration of a drag: without it, moves stop arriving the
+    // moment the pointer leaves the window and a drag appears to freeze.
+    if (is_button) {
+      if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+          msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN) {
+        SetCapture(m_widget);
+      } else if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP ||
+                 msg == WM_MBUTTONUP || msg == WM_XBUTTONUP) {
+        ReleaseCapture();
+      }
+    }
+
+    m_composition_controller->SendMouseInput(
+        static_cast<COREWEBVIEW2_MOUSE_EVENT_KIND>(msg),
+        static_cast<COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS>(GET_KEYSTATE_WPARAM(wp)),
+        mouse_data, point);
+    return true;
+  }
+
   // Visual hosting: the DirectComposition tree the web content renders into.
   // The embedder can insert its own visuals as siblings of m_webview_visual to
   // composite native content above or below the page (docs/visual-hosting.md).
@@ -1044,6 +1145,7 @@ private:
   // Visual hosting state; all null under the default windowed path.
   bool m_visual_hosting = false;
   bool m_composition_failed = false;
+  bool m_mouse_tracking = false;
   ICoreWebView2CompositionController *m_composition_controller = nullptr;
   native_library m_dcomp_lib{L"dcomp.dll"};
   IDCompositionDevice *m_dcomp_device = nullptr;
