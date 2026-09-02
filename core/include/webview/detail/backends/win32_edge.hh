@@ -1052,10 +1052,23 @@ private:
     controller2->Release();
   }
 
+  /// Visual hosting is opt-OUT: `WEBVIEW_VISUAL_HOSTING=0` forces the windowed
+  /// path. It defaults ON because the windowed path cannot composite native
+  /// content with web content at all (docs/visual-hosting.md), and every
+  /// failure mode along the way is already handled — an older runtime without
+  /// ICoreWebView2Environment3 falls back to windowed hosting, and a
+  /// composition tree that cannot be built reports it.
+  ///
+  /// UPSTREAM NOTE: an environment variable is the wrong long-term switch. A
+  /// create-option is the natural home; this keeps the branch reviewable
+  /// without inventing public API that maintainers may want shaped differently.
   static bool is_visual_hosting_requested() noexcept {
     wchar_t buf[8]{};
     auto n = GetEnvironmentVariableW(L"WEBVIEW_VISUAL_HOSTING", buf, 8);
-    return n > 0 && n < 8 && buf[0] == L'1';
+    if (n > 0 && n < 8 && buf[0] == L'0') {
+      return false;
+    }
+    return true;
   }
 
 public:
